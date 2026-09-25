@@ -2,7 +2,7 @@
 #  - finds a MinGW-w64 GCC even when it isn't on PATH yet (a freshly installed compiler often
 #    isn't visible to an already running VS Code / Explorer until you sign out and back in)
 #  - adds "Run PC twin" buttons to the PlatformIO sidebar (Project Tasks > twin > Custom).
-#    Same as: pio run -e twin -t run_twin   /   pio run -e twin -t run_twin_lan
+#    Same as: pio run -e twin -t run_twin   /   pio run -e twin -t run_twin_local
 import glob
 import os
 import shutil
@@ -39,13 +39,13 @@ env.AddCustomTarget(  # noqa: F821
     dependencies=program,
     actions=f'"{program}"',
     title="Run PC twin",
-    description="Build and start the twin; VRChat on this PC finds it via OSCQuery",
+    description="Build and start the twin; like the ESP32, VRChat finds it via OSCQuery",
 )
 
 env.AddCustomTarget(  # noqa: F821
-    name="run_twin_lan",
+    name="run_twin_local",
     dependencies=program,
-    actions=f'"{program}" --lan',
-    title="Run PC twin (LAN)",
-    description="Like the ESP32: listen on the network and advertise the LAN IP",
+    actions=f'"{program}" --local',
+    title="Run PC twin (local only)",
+    description="Loopback only, no discovery: VRChat needs --osc=9000:127.0.0.1:9101",
 )

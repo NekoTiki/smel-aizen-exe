@@ -87,7 +87,9 @@ struct Options {
   uint16_t webPort = 8000;
   uint16_t oscqueryPort = OSCQUERY_HTTP_PORT;
   bool oscquery = ENABLE_OSCQUERY;
-  bool lan = false;  // loopback only unless asked: the web controls have no authentication
+  // Listen on the network and advertise the LAN IP, like the ESP32. VRChat doesn't pick up
+  // OSCQuery services announced at 127.0.0.1, so --local (loopback only) needs the launch option.
+  bool lan = true;
   std::string name = std::string(OSCQUERY_NAME) + "-TWIN";
 };
 
@@ -262,23 +264,33 @@ MdnsService mdnsServices[2];
 VOID WINAPI onMdnsRegistered(DWORD status, PVOID context, PDNS_SERVICE_INSTANCE instance) {
   auto* svc = static_cast<MdnsService*>(context);
   if (status == ERROR_SUCCESS) {
-    hal::log("[oscquery] mDNS: %s registered\n", svc->label.c_str());
+    hal::log("[mdns] %s: registered with Windows, now visible on the network\n", svc->label.c_str());
   } else {
-    hal::log("[oscquery] mDNS: %s registration failed (error %lu)\n", svc->label.c_str(), status);
+    hal::log("[mdns] %s: registration FAILED (error %lu) - VRChat won't find the twin\n", svc->label.c_str(),
+             status);
   }
   if (instance) DnsServiceFreeInstance(instance);
 }
 
 std::wstring widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
-void registerMdns(MdnsService& svc, const std::string& type, uint16_t port, const std::string& ip) {
-  wchar_t host[256];
-  DWORD hostLen = 256;
-  if (!GetComputerNameExW(ComputerNameDnsHostname, host, &hostLen)) wcscpy(host, L"vrc-relay-twin");
-  std::wstring hostName = std::wstring(host) + L".local";
+// The services point at the PC's own mDNS name; the twin doesn't claim DEVICE_HOSTNAME.local.
+std::string pcHostName() {
+  char host[256];
+  DWORD hostLen = sizeof host;
+  if (!GetComputerNameExA(ComputerNameDnsHostname, host, &hostLen)) return "localhost.local";
+  return std::string(host) + ".local";
+}
 
-  svc.label = opts.name + "." + type;
+void registerMdns(MdnsService& svc, const std::string& type, uint16_t port, const std::string& ip,
+                  const char* what) {
+  std::string host = pcHostName();
+  svc.label = type;
   svc.instanceName = widen(opts.name + "." + type + ".local");
+  hal::log("[mdns] service   %s  \"%s\" port %u -> %s (%s)  (%s)\n", type.c_str(), opts.name.c_str(), port,
+           host.c_str(), ip.c_str(), what);
+
+  std::wstring hostName = widen(host);
   IP4_ADDRESS addr = 0;
   inet_pton(AF_INET, ip.c_str(), &addr);
   svc.instance = DnsServiceConstructInstance(svc.instanceName.c_str(), hostName.c_str(), &addr, nullptr, port, 0, 0,
@@ -291,8 +303,7 @@ void registerMdns(MdnsService& svc, const std::string& type, uint16_t port, cons
   svc.request.unicastEnabled = FALSE;
   DWORD result = DnsServiceRegister(&svc.request, nullptr);
   if (result != DNS_REQUEST_PENDING) {
-    hal::log("[oscquery] mDNS: couldn't register %s (error %lu, needs Windows 10 1809+)\n", svc.label.c_str(),
-             result);
+    hal::log("[mdns] %s: registration FAILED (error %lu, needs Windows 10 1809+)\n", svc.label.c_str(), result);
   }
 }
 
@@ -303,6 +314,7 @@ void deregisterMdns() {
     DnsServiceDeRegister(&svc.request, nullptr);
     DnsServiceFreeInstance(svc.instance);
     svc.instance = nullptr;
+    hal::log("[mdns] %s: removed\n", svc.label.c_str());
   }
 }
 
@@ -357,9 +369,12 @@ void usage() {
       "  --web-port N        status page port (default %u)\n"
       "  --oscquery-port N   OSCQuery HTTP port (default %u)\n"
       "  --name NAME         OSCQuery service name (default %s)\n"
-      "  --no-oscquery       don't advertise; point VRChat at the twin with --osc=9000:127.0.0.1:<osc-port>\n"
-      "  --lan               listen on the network and advertise the LAN IP, like the ESP32 does\n"
-      "                      (for VRChat on another PC or a Quest; Windows Firewall will ask)\n",
+      "  --no-oscquery       don't advertise; point VRChat at the twin with the launch option\n"
+      "  --local             loopback only: nothing reachable from the network, no OSCQuery discovery;\n"
+      "                      VRChat needs the launch option --osc=9000:127.0.0.1:<osc-port>\n"
+      "\n"
+      "By default the twin listens on the network and advertises its LAN IP, like the ESP32.\n"
+      "Windows Firewall asks once; allowing private networks is enough.\n",
       opts.oscPort, opts.webPort, opts.oscqueryPort, opts.name.c_str());
 }
 
@@ -378,7 +393,8 @@ void parseArgs(int argc, char** argv) {
     else if (a == "--oscquery-port") opts.oscqueryPort = static_cast<uint16_t>(atoi(value()));
     else if (a == "--name") opts.name = value();
     else if (a == "--no-oscquery") opts.oscquery = false;
-    else if (a == "--lan") opts.lan = true;
+    else if (a == "--local") opts.lan = false;
+    else if (a == "--lan") opts.lan = true;  // the default; kept for older scripts
     else {
       usage();
       exit(a == "--help" || a == "-h" ? 0 : 2);
@@ -420,23 +436,39 @@ int main(int argc, char** argv) {
   webSock = bindSocket(SOCK_STREAM, opts.webPort, "status page");
   if (opts.oscquery) oscquerySock = bindSocket(SOCK_STREAM, opts.oscqueryPort, "OSCQuery");
 
-  // By default VRChat on this PC reaches the twin over loopback, as with any local OSCQuery app.
   std::string ip = opts.lan ? lanIp() : "127.0.0.1";
-  bridge::setDeviceInfo({"PC twin", ip, opts.oscPort, opts.oscquery ? opts.name : ""});
-  if (opts.oscquery) {
-    registerMdns(mdnsServices[0], "_oscjson._tcp", opts.oscqueryPort, ip);
-    registerMdns(mdnsServices[1], "_osc._udp", opts.oscPort, ip);
-    hal::log("[oscquery] advertising \"%s\" (HTTP %u, OSC UDP %u)\n", opts.name.c_str(), opts.oscqueryPort,
-             opts.oscPort);
+  bool discoverable = opts.oscquery && opts.lan;
+  bridge::setDeviceInfo({"PC twin", ip, opts.oscPort, discoverable ? opts.name : ""});
+
+  if (opts.lan) {
+    hal::log("[wifi] connected, IP %s (listening on the network, like the ESP32)\n", ip.c_str());
+  } else {
+    hal::log("[wifi] connected, IP %s (--local: loopback only, unreachable from the network)\n", ip.c_str());
   }
 
-  hal::log("[wifi] connected, IP %s (%s)\n", ip.c_str(), opts.lan ? "PC network" : "loopback, --lan for network");
-  hal::log("[wifi] status page: http://localhost:%u/\n", opts.webPort);
-  if (opts.oscquery) {
-    hal::log("[wifi] VRChat should find the twin by itself (HUD: \"sending data to %s\")\n", opts.name.c_str());
+  // mDNS: what the twin announces. Unlike the ESP32 it claims no hostname and no _http._tcp.
+  hal::log("[mdns] hostname  none - the twin doesn't register %s.local (only the ESP32 does)\n", DEVICE_HOSTNAME);
+  if (discoverable) {
+    registerMdns(mdnsServices[0], "_oscjson._tcp", opts.oscqueryPort, ip, "OSCQuery, VRChat reads this");
+    registerMdns(mdnsServices[1], "_osc._udp", opts.oscPort, ip, "OSC input");
+  } else if (!opts.oscquery) {
+    hal::log("[mdns] OSCQuery off (--no-oscquery): nothing announced, VRChat won't find the twin by itself\n");
+  } else {
+    hal::log("[mdns] nothing announced: VRChat ignores OSCQuery services at 127.0.0.1 (drop --local)\n");
   }
-  hal::log("[wifi] %sVRChat launch option: --osc=9000:%s:%u\n", opts.oscquery ? "fallback " : "", ip.c_str(),
-           opts.oscPort);
+
+  if (opts.lan) {
+    hal::log("[web] status page  http://localhost:%u/  or  http://%s:%u/\n", opts.webPort, ip.c_str(), opts.webPort);
+  } else {
+    hal::log("[web] status page  http://localhost:%u/\n", opts.webPort);
+  }
+  hal::log("[osc] listening on UDP %u (the ESP32 uses %u)\n", opts.oscPort, OSC_LISTEN_PORT);
+  if (discoverable) {
+    hal::log("[vrchat] should find the twin by itself (HUD: \"sending data to %s\")\n", opts.name.c_str());
+    hal::log("[vrchat] fallback launch option: --osc=9000:%s:%u\n", ip.c_str(), opts.oscPort);
+  } else {
+    hal::log("[vrchat] launch option needed: --osc=9000:%s:%u\n", ip.c_str(), opts.oscPort);
+  }
   printCommands();
 
   std::thread(readConsole).detach();

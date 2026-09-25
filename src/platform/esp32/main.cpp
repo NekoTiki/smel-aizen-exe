@@ -91,27 +91,43 @@ void onWifiUp() {
   String ip = WiFi.localIP().toString();
   bridge::setDeviceInfo({"ESP32", ip.c_str(), OSC_LISTEN_PORT, ENABLE_OSCQUERY ? oscqueryName.c_str() : ""});
 
+  hal::log("[wifi] connected, IP %s (RSSI %d dBm)\n", ip.c_str(), WiFi.RSSI());
+
+  // mDNS: what this board announces on the network. ESPmDNS applies the instance name to every
+  // service, so all three show up under the same name.
   MDNS.end();
-  if (MDNS.begin(DEVICE_HOSTNAME)) {
-    MDNS.addService("http", "tcp", 80);
+  bool mdnsUp = MDNS.begin(DEVICE_HOSTNAME);
+  if (mdnsUp) {
+    hal::log("[mdns] hostname  %s.local -> %s\n", DEVICE_HOSTNAME, ip.c_str());
+    if (ENABLE_OSCQUERY) MDNS.setInstanceName(oscqueryName.c_str());
+    const char* instance = ENABLE_OSCQUERY ? oscqueryName.c_str() : DEVICE_HOSTNAME;
+    auto announce = [&](const char* service, const char* proto, uint16_t port, const char* what) {
+      bool ok = MDNS.addService(service, proto, port);
+      hal::log("[mdns] service   %s.%s  \"%s\" port %u  (%s)%s\n", service, proto, instance, port, what,
+               ok ? "" : "  FAILED");
+    };
+    announce("_http", "_tcp", 80, "status page");
     if (ENABLE_OSCQUERY) {
-      MDNS.setInstanceName(oscqueryName.c_str());
-      MDNS.addService("_oscjson", "_tcp", OSCQUERY_HTTP_PORT);
-      MDNS.addService("_osc", "_udp", OSC_LISTEN_PORT);
-      hal::log("[oscquery] advertising \"%s\" (HTTP %u, OSC UDP %u)\n", oscqueryName.c_str(),
-               OSCQUERY_HTTP_PORT, OSC_LISTEN_PORT);
+      announce("_oscjson", "_tcp", OSCQUERY_HTTP_PORT, "OSCQuery, VRChat reads this");
+      announce("_osc", "_udp", OSC_LISTEN_PORT, "OSC input");
+    } else {
+      hal::log("[mdns] OSCQuery off (ENABLE_OSCQUERY = false): VRChat won't find the board by itself\n");
     }
   } else {
-    hal::log("[wifi] mDNS failed to start - OSCQuery discovery won't work\n");
+    hal::log("[mdns] FAILED to start: no %s.local and no OSCQuery discovery\n", DEVICE_HOSTNAME);
   }
 
-  hal::log("[wifi] connected, IP %s (RSSI %d dBm)\n", ip.c_str(), WiFi.RSSI());
-  hal::log("[wifi] status page: http://%s.local/  or  http://%s/\n", DEVICE_HOSTNAME, ip.c_str());
-  if (ENABLE_OSCQUERY) {
-    hal::log("[wifi] VRChat should find this board by itself (HUD: \"sending data to ...\")\n");
-    hal::log("[wifi] fallback VRChat launch option: --osc=9000:%s:%u\n", ip.c_str(), OSC_LISTEN_PORT);
+  if (mdnsUp) {
+    hal::log("[web] status page  http://%s.local/  or  http://%s/\n", DEVICE_HOSTNAME, ip.c_str());
   } else {
-    hal::log("[wifi] VRChat launch option: --osc=9000:%s:%u\n", ip.c_str(), OSC_LISTEN_PORT);
+    hal::log("[web] status page  http://%s/\n", ip.c_str());
+  }
+  hal::log("[osc] listening on UDP %u\n", OSC_LISTEN_PORT);
+  if (ENABLE_OSCQUERY && mdnsUp) {
+    hal::log("[vrchat] should find this board by itself (HUD: \"sending data to %s\")\n", oscqueryName.c_str());
+    hal::log("[vrchat] fallback launch option: --osc=9000:%s:%u\n", ip.c_str(), OSC_LISTEN_PORT);
+  } else {
+    hal::log("[vrchat] launch option needed: --osc=9000:%s:%u\n", ip.c_str(), OSC_LISTEN_PORT);
   }
 }
 

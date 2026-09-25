@@ -10,7 +10,8 @@ status page, OSCQuery) compiled as a Windows program. Only the thin hardware lay
 | mDNS / OSCQuery discovery | ESPmDNS | Windows' built-in mDNS responder |
 | Relays | GPIO pins | simulated: pin levels printed to the console |
 | OSC port | 9001 | 9101 (9001 is VRChat's default output, other apps use it) |
-| Status page | `http://vrc-relay.local/` (port 80) | `http://localhost:8000/` |
+| Status page | `http://vrc-relay.local/` (port 80) | `http://localhost:8000/` (no `.local` name) |
+| mDNS announcements | `vrc-relay.local`, `_http._tcp`, `_oscjson._tcp`, `_osc._udp` | only `_oscjson._tcp` and `_osc._udp` |
 | WiFi drop | real | type `wifi down` / `wifi up` in the console |
 
 VRChat discovers the twin through OSCQuery exactly as it discovers the board, and shows
@@ -31,8 +32,8 @@ example to your friend's PC.
 ### In VS Code (PlatformIO extension)
 
 - **Run:** PlatformIO sidebar (alien icon) → *Project Tasks* → **twin** → *Custom* →
-  **Run PC twin**, or **Run PC twin (LAN)** for `--lan`. It builds first if needed, then runs in
-  the terminal panel. Type `wifi down`, `wifi up` or `quit` there. Ctrl+C also stops it.
+  **Run PC twin** (or **Run PC twin (local only)** for `--local`). It builds first if needed, then
+  runs in the terminal panel. Type `wifi down`, `wifi up` or `quit` there. Ctrl+C also stops it.
 - **Build only:** *twin* → *General* → **Build**.
 - **Code highlighting:** IntelliSense follows the *active* environment. Pick `env:twin` in the
   status bar environment switcher (or *PlatformIO: Switch Project Environment*) while editing
@@ -44,10 +45,17 @@ example to your friend's PC.
 
 ## Using it with VRChat
 
-1. Start the twin, then start VRChat with OSC enabled (Action Menu → Options → OSC).
-   No launch options needed.
-2. Watch for the HUD notice. The console prints `[oscquery] HOST_INFO read by 127.0.0.1` when
-   VRChat has found the twin.
+1. Start the twin and VRChat with OSC enabled (Action Menu → Options → OSC), in either order.
+   No launch options needed. The first time, Windows Firewall asks about `program.exe`: allow it
+   on private networks.
+2. Check the startup log. It lists exactly what the twin announces on the network (`[mdns]` lines)
+   and where the status page is (`[web]`). Once VRChat has found the twin, the console prints
+   `[oscquery] HOST_INFO read by ...`, once per network adapter VRChat tries, then the first
+   `[osc] new parameter` lines.
+
+   VRChat remembers where it found the twin: if you restart the twin while VRChat keeps running
+   (same IP and ports), parameters arrive right away without a new `HOST_INFO` line. That's
+   normal. The status page may then say "not discovered yet" even though data is coming in.
 3. Touch a contact. The console shows the full chain the ESP32 would go through:
    ```
    4.885 [osc] RelayHeadpat = true
@@ -78,14 +86,17 @@ program.exe --help
   --web-port N        status page port (default 8000)
   --oscquery-port N   OSCQuery HTTP port (default 8080)
   --name NAME         OSCQuery service name
-  --no-oscquery       don't advertise; use the launch option --osc=9000:127.0.0.1:<osc-port>
-  --lan               listen on the network and advertise the LAN IP, like the ESP32 does
+  --no-oscquery       don't advertise; point VRChat at the twin with the launch option
+  --local             loopback only: nothing reachable from the network, no OSCQuery discovery
 ```
 
-By default the twin only listens on `127.0.0.1`, like other local OSCQuery apps. That's enough for
-VRChat on the same PC, avoids a firewall prompt, and keeps the relay buttons off the network.
-Use `--lan` to test from another device, for example VRChat on a Quest, or your friend's PC
-talking to yours. Windows Firewall will ask for permission the first time.
+By default the twin listens on the network and announces its LAN IP, like the ESP32. That also
+means anyone on your network can open the status page and switch the (simulated) relays, just as
+with the board.
+
+`--local` keeps everything on `127.0.0.1`, but **VRChat doesn't discover OSCQuery services
+announced at 127.0.0.1**. In that mode the twin announces nothing, and you have to start VRChat
+with `--osc=9000:127.0.0.1:9101`.
 
 ## What the twin can't tell you
 
@@ -94,6 +105,7 @@ talking to yours. Windows Firewall will ask for permission the first time.
   [board guide](esp32-s3-devkitc-1.md)).
 - Whether your friend's router passes mDNS between the ESP32 and the PC. The twin runs on the same
   machine as VRChat, so it sidesteps guest networks and client isolation.
+- The `vrc-relay.local` name and the `_http._tcp` announcement, which only the ESP32 makes.
 
 Everything else (which parameters arrive, how each relay mode reacts, avatar changes, the status
 page, OSCQuery discovery) runs through the same code as on the ESP32.
