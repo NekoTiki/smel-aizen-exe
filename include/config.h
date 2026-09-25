@@ -48,11 +48,14 @@ constexpr bool ENABLE_WEB_CONTROL = true;
 // feedback:  optional Bool avatar parameter the ESP32 sets to the relay state (nullptr = off).
 //            It must exist in the avatar's Expression Parameters to have any effect.
 //
-// The pins below are picked per board at compile time (pio run -e <board>).
+// The pins below are picked per board at compile time (pio run -e <board>). The PC twin
+// (pio run -e twin) uses the ESP32-S3-DevKitC-1 set.
 // ---------------------------------------------------------------------------------------------
+#if __has_include("sdkconfig.h")
 #include "sdkconfig.h"
+#endif
 
-#if CONFIG_IDF_TARGET_ESP32S3
+#if CONFIG_IDF_TARGET_ESP32S3 || defined(TWIN_BOARD_ESP32S3)
 // ESP32-S3-DevKitC-1: GPIO 4-7 are header J1 pins 4-7, with 5V and G at the bottom of the same
 // header (pins 21, 22). Other free outputs: 1, 2, 8-18, 21, 47.
 // Avoid: 0, 3, 45, 46 (strapping), 19/20 (USB), 43/44 (UART/serial monitor),

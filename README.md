@@ -10,6 +10,10 @@ a status page.
       └──── UDP/OSC :9000 ────────┘  (optional feedback parameters)
 ```
 
+**No hardware yet?** The [PC twin](docs/pc-twin.md) runs the same code on Windows
+(`pio run -e twin`). VRChat discovers it through OSCQuery like the real board, and relay switching
+is shown in the console.
+
 ## 1. Firmware
 
 Two boards are set up: **ESP32-S3-DevKitC-1** (the default, see
@@ -80,6 +84,7 @@ python tools/fake_vrchat.py listen                          # see what VRChat se
 ```
 
 `listen` is also the quickest way to find the exact parameter names your avatar sends.
+Add `--port 9101` to send to the [PC twin](docs/pc-twin.md) instead.
 
 ## Relay modes and safety
 
@@ -102,8 +107,8 @@ python tools/fake_vrchat.py listen                          # see what VRChat se
 
 Relay board `VCC` → 5V (VIN), `GND` → GND, `IN1..IN4` → the default pins in `config.h`:
 GPIO 4, 5, 6, 7 on the ESP32-S3-DevKitC-1 (full table in the
-[board guide](docs/esp32-s3-devkitc-1.md)), or GPIO 26, 27, 25, 33 on a generic ESP32. Most cheap relay boards are **active-low** (`activeLow = true`). Some 5V boards don't
-switch reliably from 3.3V logic. If a relay won't release, use a board rated for 3.3V inputs or one
+[board guide](docs/esp32-s3-devkitc-1.md)), or GPIO 26, 27, 25, 33 on a generic ESP32. Most cheap relay boards are **active-low**
+(`activeLow = true`). Some 5V boards don't switch reliably from 3.3V logic. If a relay won't release, use a board rated for 3.3V inputs or one
 with a separate `JD-VCC` jumper.
 
 ⚠️ Mains voltage can kill you. Use enclosed, rated modules (or low-voltage loads) for anything
@@ -114,11 +119,14 @@ plugged into the wall.
 | File | Purpose |
 |------|---------|
 | `include/config.h` | Ports, options and the relay table: the file you edit |
-| `src/main.cpp` | WiFi, UDP receive loop, parameter handling, status page and JSON API |
-| `src/relays.cpp` | Relay modes, pulses, safety cutoff, active-low handling |
-| `src/osc.cpp` | Small dependency-free OSC message/bundle parser and encoder |
-| `src/oscquery.cpp` | OSCQuery HTTP endpoints (port 8080) and mDNS advertising |
+| `src/core/bridge.cpp` | Parameter handling, status page + JSON API, OSCQuery responses (shared) |
+| `src/core/relays.cpp` | Relay modes, pulses, safety cutoff, active-low handling (shared) |
+| `src/core/osc.cpp` | Small dependency-free OSC message/bundle parser and encoder (shared) |
+| `src/platform/esp32/main.cpp` | ESP32: WiFi, UDP, web servers, mDNS, GPIO |
+| `src/platform/native/main.cpp` | PC twin: Windows sockets, Windows mDNS, simulated GPIO |
 | `docs/esp32-s3-devkitc-1.md` | Board guide: variants, USB ports, wiring, safe pins |
+| `docs/pc-twin.md` | Running the project on a PC without hardware |
+| `scripts/twin_targets.py` | Adds the "Run PC twin" tasks to the PlatformIO sidebar |
 | `tools/fake_vrchat.py` | Send test parameters to the ESP32, or print incoming OSC |
 
 HTTP API: `GET /api/state` (JSON with relays and all seen parameters),

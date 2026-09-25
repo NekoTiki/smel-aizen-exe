@@ -1,6 +1,6 @@
 #include "relays.h"
 
-#include <Arduino.h>
+#include "hal.h"
 #include <string.h>
 
 RelayBank::RelayBank(const RelayConfig* configs, size_t count)
@@ -11,7 +11,7 @@ void RelayBank::begin(ChangeCallback onChange) {
   for (size_t i = 0; i < count_; i++) {
     // Set the OFF level before enabling the output so active-low boards don't click on boot.
     drive(i, false);
-    pinMode(configs_[i].pin, OUTPUT);
+    hal::pinOutput(configs_[i].pin);
     drive(i, false);
   }
 }
@@ -35,7 +35,7 @@ bool RelayBank::handleParameter(const char* name, float value) {
       case RelayMode::Pulse:
         if (rising) {
           set(i, true);
-          st.onSince = millis();  // re-touching during a pulse extends it
+          st.onSince = hal::millis();  // re-touching during a pulse extends it
         }
         break;
       case RelayMode::Toggle:
@@ -51,7 +51,7 @@ void RelayBank::set(size_t index, bool on) {
   State& st = states_[index];
   if (st.on == on) return;
   st.on = on;
-  if (on) st.onSince = millis();
+  if (on) st.onSince = hal::millis();
   drive(index, on);
   if (onChange_) onChange_(index, on);
 }
@@ -64,7 +64,7 @@ void RelayBank::allOff() {
 }
 
 void RelayBank::update() {
-  uint32_t now = millis();
+  uint32_t now = hal::millis();
   for (size_t i = 0; i < count_; i++) {
     const RelayConfig& cfg = configs_[i];
     State& st = states_[i];
@@ -73,7 +73,7 @@ void RelayBank::update() {
     if (cfg.mode == RelayMode::Pulse && elapsed >= cfg.pulseMs) {
       set(i, false);
     } else if (cfg.maxOnMs > 0 && elapsed >= cfg.maxOnMs) {
-      Serial.printf("[relay] %s hit maxOnMs (%u ms), forcing off\n", cfg.param, (unsigned)cfg.maxOnMs);
+      hal::log("[relay] %s hit maxOnMs (%u ms), forcing off\n", cfg.param, (unsigned)cfg.maxOnMs);
       set(i, false);
     }
   }
@@ -81,5 +81,5 @@ void RelayBank::update() {
 
 void RelayBank::drive(size_t index, bool on) {
   const RelayConfig& cfg = configs_[index];
-  digitalWrite(cfg.pin, (on != cfg.activeLow) ? HIGH : LOW);
+  hal::pinWrite(cfg.pin, on != cfg.activeLow);
 }
