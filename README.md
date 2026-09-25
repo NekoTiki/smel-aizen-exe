@@ -128,3 +128,7 @@ HTTP API: `GET /api/state` (JSON with relays and all seen parameters),
 
 - Store the relay table in NVS/LittleFS and make it editable from the web page.
 - Add authentication to the web controls.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
