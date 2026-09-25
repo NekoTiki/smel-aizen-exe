@@ -53,4 +53,18 @@ HttpResponse handleWeb(const HttpRequest& req);
 // OSCQuery endpoints: HOST_INFO and the address tree (OSCQUERY_HTTP_PORT).
 HttpResponse handleOscQuery(const HttpRequest& req);
 
+// ----- Live status page (Server-Sent Events on GET /api/events) ---------------------------------
+// The platform keeps each /api/events connection open: it writes kEventStreamHeaders and
+// eventSnapshot() to a new client, then broadcasts whatever takeEvents() returns to all of them.
+
+extern const char kEventStreamHeaders[];
+constexpr char kEventsPath[] = "/api/events";
+
+// Full state as one SSE event. Send to each new client.
+std::string eventSnapshot();
+
+// Call every loop iteration. Returns "" or SSE text to send to every open client: relay changes
+// immediately, parameter/counter changes batched, a heartbeat comment when idle.
+std::string takeEvents(bool anyClients);
+
 }  // namespace bridge

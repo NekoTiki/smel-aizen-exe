@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <set>
+
 #include "config.h"
 #include "hal.h"
 #include "osc.h"
@@ -14,6 +16,11 @@ namespace {
 constexpr char kParamPrefix[] = "/avatar/parameters/";
 constexpr size_t kParamPrefixLen = sizeof(kParamPrefix) - 1;
 constexpr size_t kMaxTrackedParams = 128;
+
+// Live page updates: relay changes go out at once; parameter and counter changes are batched,
+// because VRChat sends some parameters (Velocity*, Viseme, ...) many times a second.
+constexpr uint32_t kEventBatchMs = 150;
+constexpr uint32_t kEventHeartbeatMs = 15000;  // lets the platform notice dead connections
 
 struct SeenParam {
   std::string value;
@@ -33,6 +40,13 @@ std::map<std::string, SeenParam> seenParams;  // everything VRChat reported, for
 std::string oscqueryClient;
 uint32_t oscqueryAt = 0;
 uint8_t txBuf[256];
+
+// What changed since the last live update.
+bool relaysDirty = false;
+bool infoDirty = false;
+bool snapshotNeeded = false;  // parameters were cleared: resend everything
+std::set<std::string> dirtyParams;
+uint32_t lastEventAt = 0;
 
 const char kJson[] = "application/json";
 
@@ -78,6 +92,7 @@ void sendToVrchat(const char* address, const osc::Value& value) {
 void onRelayChanged(size_t index, bool on) {
   const RelayConfig& cfg = relays.config(index);
   hal::log("[relay] %-20s GPIO%-2u -> %s\n", cfg.param, cfg.pin, on ? "ON" : "off");
+  relaysDirty = true;
   if (cfg.feedbackParam) {
     std::string address = std::string(kParamPrefix) + cfg.feedbackParam;
     sendToVrchat(address.c_str(), osc::Value::fromBool(on));
@@ -90,12 +105,15 @@ void onOscMessage(const char* address, const osc::Value& value) {
     auto it = seenParams.find(name);
     if (it != seenParams.end()) {
       it->second = {formatValue(value), hal::millis()};
+      dirtyParams.insert(name);
     } else if (seenParams.size() < kMaxTrackedParams) {
       seenParams[name] = {formatValue(value), hal::millis()};
+      dirtyParams.insert(name);
       hal::log("[osc] new parameter: %s = %s\n", name, formatValue(value).c_str());
     }
 
     bool mapped = relays.handleParameter(name, value.asFloat());
+    if (mapped) relaysDirty = true;  // the "Input" column may have changed even if no relay did
     if (LOG_ALL_PARAMS || mapped) hal::log("[osc] %s = %s\n", name, formatValue(value).c_str());
     return;
   }
@@ -105,10 +123,96 @@ void onOscMessage(const char* address, const osc::Value& value) {
     hal::log("[osc] avatar changed: %s - all relays off\n", currentAvatar.c_str());
     relays.allOff();
     seenParams.clear();
+    snapshotNeeded = true;
     return;
   }
 
   if (LOG_ALL_PARAMS) hal::log("[osc] %s = %s\n", address, formatValue(value).c_str());
+}
+
+// ----- State as JSON -----------------------------------------------------------------------------
+// One shape for /api/state and the live updates: {"info":{...},"relays":[...],"params":[...]}.
+// Ages are relative to "now" so the page doesn't need a synchronised clock.
+
+const char* modeName(RelayMode mode) {
+  switch (mode) {
+    case RelayMode::Follow: return "follow";
+    case RelayMode::Pulse: return "pulse";
+    case RelayMode::Toggle: return "toggle";
+  }
+  return "?";
+}
+
+std::string infoJson(uint32_t now) {
+  std::string json;
+  json += "{\"device\":" + str(device.kind);
+  json += ",\"ip\":" + str(device.ip);
+  json += ",\"port\":" + num(device.oscPort);
+  json += ",\"vrchat\":" + (vrchatIp.empty() ? std::string("null") : str(vrchatIp));
+  json += ",\"lastPacketMs\":" + num(now - lastPacketAt);
+  json += ",\"packets\":" + num(packetCount);
+  json += ",\"malformed\":" + num(malformedCount);
+  json += ",\"avatar\":" + str(currentAvatar);
+  json += ",\"webControl\":" + std::string(boolean(ENABLE_WEB_CONTROL));
+  json += ",\"oscquery\":" + std::string(boolean(!device.oscqueryName.empty()));
+  json += ",\"oscqueryName\":" + str(device.oscqueryName);
+  json += ",\"oscqueryClient\":" + str(oscqueryClient);
+  json += ",\"oscqueryAgeMs\":" + num(now - oscqueryAt);
+  json += "}";
+  return json;
+}
+
+std::string relaysJson() {
+  std::string json = "[";
+  for (size_t i = 0; i < relays.size(); i++) {
+    const RelayConfig& cfg = relays.config(i);
+    if (i) json += ',';
+    json += "{\"param\":" + str(cfg.param) + ",\"pin\":" + num(cfg.pin) + ",\"mode\":\"" + modeName(cfg.mode) +
+            "\",\"input\":" + boolean(relays.inputActive(i)) + ",\"on\":" + boolean(relays.isOn(i)) + "}";
+  }
+  return json + "]";
+}
+
+std::string paramJson(const std::string& name, const SeenParam& p, uint32_t now) {
+  return "{\"name\":" + str(name) + ",\"value\":" + str(p.value) + ",\"ageMs\":" + num(now - p.updatedAt) + "}";
+}
+
+std::string stateJson() {
+  uint32_t now = hal::millis();
+  std::string json;
+  json.reserve(768 + seenParams.size() * 64);
+  json += "{\"info\":" + infoJson(now) + ",\"relays\":" + relaysJson() + ",\"params\":[";
+  bool first = true;
+  for (const auto& kv : seenParams) {
+    if (!first) json += ',';
+    first = false;
+    json += paramJson(kv.first, kv.second, now);
+  }
+  return json + "]}";
+}
+
+// Only what changed since the last event. Info and relays are small, so they always go along.
+std::string updateJson() {
+  uint32_t now = hal::millis();
+  std::string json = "{\"info\":" + infoJson(now) + ",\"relays\":" + relaysJson() + ",\"params\":[";
+  bool first = true;
+  for (const std::string& name : dirtyParams) {
+    auto it = seenParams.find(name);
+    if (it == seenParams.end()) continue;
+    if (!first) json += ',';
+    first = false;
+    json += paramJson(name, it->second, now);
+  }
+  return json + "]}";
+}
+
+std::string sseEvent(const char* type, const std::string& data) {
+  return std::string("event: ") + type + "\ndata: " + data + "\n\n";
+}
+
+void clearDirty() {
+  relaysDirty = infoDirty = snapshotNeeded = false;
+  dirtyParams.clear();
 }
 
 // ----- Web status page ---------------------------------------------------------------------------
@@ -123,78 +227,50 @@ td,th{border-bottom:1px solid #333;padding:6px 8px;text-align:left;font-size:14p
 .on{color:#4ade80;font-weight:600}.off{color:#888}
 button{background:#333;color:#eee;border:1px solid #555;border-radius:4px;padding:4px 10px;cursor:pointer}
 code{background:#222;padding:2px 6px;border-radius:4px}#info{color:#aaa;font-size:14px}
+#link{font-size:13px;margin-left:8px;font-weight:400}#link.live{color:#4ade80}#link.down{color:#f87171}#link.poll{color:#fbbf24}
 </style></head><body>
-<h2>VRChat OSC relays</h2>
+<h2>VRChat OSC relays <span id="link"></span></h2>
 <p id="info"></p>
 <table><thead><tr><th>Relay parameter</th><th>GPIO</th><th>Mode</th><th>Input</th><th>Relay</th><th></th></tr></thead><tbody id="relays"></tbody></table>
 <h3>Parameters from VRChat</h3>
 <table><thead><tr><th>Name</th><th>Value</th><th>Age</th></tr></thead><tbody id="params"></tbody></table>
 <script>
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-async function relay(i,on){await fetch(`/api/relay?i=${i}&on=${on?1:0}`,{method:'POST'});refresh();}
-async function refresh(){
-  const s=await (await fetch('/api/state')).json();
-  document.getElementById('info').innerHTML=
+const $=id=>document.getElementById(id);
+let info=null,infoAt=0,relays=[],live=false;const params=new Map();
+// Ages arrive relative to the device's clock; store them against ours so they keep ticking.
+function apply(m,full){const t=performance.now();
+  if(full)params.clear();
+  info=m.info;infoAt=t;relays=m.relays;
+  for(const p of m.params)params.set(p.name,{value:p.value,at:t-p.ageMs});
+  renderRelays();render();}
+function link(cls,text){$('link').className=cls;$('link').textContent=text;}
+function age(ms){return (ms/1000).toFixed(1)+' s';}
+function render(){if(!info)return;const t=performance.now(),dt=t-infoAt,s=info;
+  $('info').innerHTML=
     `${esc(s.device)} ${esc(s.ip)} &middot; ${s.oscquery?'OSCQuery on, fallback':'VRChat'} launch option: <code>--osc=9000:${esc(s.ip)}:${s.port}</code><br>`+
-    (s.oscquery?(s.oscqueryClient?`OSCQuery: discovered by ${esc(s.oscqueryClient)} ${(s.oscqueryAgeMs/1000).toFixed(0)} s ago<br>`:`OSCQuery: advertised as ${esc(s.oscqueryName)}, not discovered yet<br>`):'')+
-    (s.vrchat?`VRChat at ${esc(s.vrchat)}, last packet ${s.lastPacketMs} ms ago, ${s.packets} packets (${s.malformed} malformed)`:'No OSC traffic yet')+
+    (s.oscquery?(s.oscqueryClient?`OSCQuery: discovered by ${esc(s.oscqueryClient)} ${((s.oscqueryAgeMs+dt)/1000).toFixed(0)} s ago<br>`:`OSCQuery: advertised as ${esc(s.oscqueryName)}, not discovered yet<br>`):'')+
+    (s.vrchat?`VRChat at ${esc(s.vrchat)}, last packet ${age(s.lastPacketMs+dt)} ago, ${s.packets} packets (${s.malformed} malformed)`:'No OSC traffic yet')+
     (s.avatar?`<br>Avatar ${esc(s.avatar)}`:'');
-  document.getElementById('relays').innerHTML=s.relays.map((r,i)=>
+  $('params').innerHTML=[...params.keys()].sort().map(n=>{const p=params.get(n);
+    return `<tr><td>${esc(n)}</td><td>${esc(p.value)}</td><td>${age(t-p.at)}</td></tr>`;}).join('');}
+function renderRelays(){$('relays').innerHTML=relays.map((r,i)=>
     `<tr><td>${esc(r.param)}</td><td>${r.pin}</td><td>${r.mode}</td><td>${r.input?'active':'-'}</td>`+
     `<td class="${r.on?'on':'off'}">${r.on?'ON':'off'}</td>`+
-    `<td>${s.webControl?`<button onclick="relay(${i},${!r.on})">${r.on?'Turn off':'Turn on'}</button>`:''}</td></tr>`).join('');
-  document.getElementById('params').innerHTML=s.params.map(p=>
-    `<tr><td>${esc(p.name)}</td><td>${esc(p.value)}</td><td>${(p.ageMs/1000).toFixed(1)} s</td></tr>`).join('');
-}
-refresh();setInterval(()=>refresh().catch(()=>{}),1000);
+    `<td>${info&&info.webControl?`<button onclick="relay(${i},${!r.on})">${r.on?'Turn off':'Turn on'}</button>`:''}</td></tr>`).join('');}
+async function relay(i,on){await fetch(`/api/relay?i=${i}&on=${on?1:0}`,{method:'POST'});if(!live)poll();}
+async function poll(){try{apply(await (await fetch('/api/state')).json(),true);}catch(e){link('down','offline');}}
+let polling=null;
+function startPolling(){if(polling)return;link('poll','polling');poll();polling=setInterval(poll,1000);}
+// Live updates (Server-Sent Events): the device pushes changes. The browser reconnects by itself
+// after a reboot or WiFi drop; if the device refuses the stream, fall back to polling.
+if(window.EventSource){const es=new EventSource('/api/events');
+  es.addEventListener('state',e=>{live=true;link('live','live');apply(JSON.parse(e.data),true);});
+  es.addEventListener('update',e=>apply(JSON.parse(e.data),false));
+  es.onerror=()=>{live=false;if(es.readyState===EventSource.CLOSED)startPolling();else link('down','reconnecting…');};
+}else startPolling();
+setInterval(render,500);
 </script></body></html>)HTML";
-
-const char* modeName(RelayMode mode) {
-  switch (mode) {
-    case RelayMode::Follow: return "follow";
-    case RelayMode::Pulse: return "pulse";
-    case RelayMode::Toggle: return "toggle";
-  }
-  return "?";
-}
-
-std::string stateJson() {
-  uint32_t now = hal::millis();
-  std::string json;
-  json.reserve(512 + seenParams.size() * 64);
-  json += "{\"device\":" + str(device.kind);
-  json += ",\"ip\":" + str(device.ip);
-  json += ",\"port\":" + num(device.oscPort);
-  json += ",\"vrchat\":" + (vrchatIp.empty() ? std::string("null") : str(vrchatIp));
-  json += ",\"lastPacketMs\":" + num(now - lastPacketAt);
-  json += ",\"packets\":" + num(packetCount);
-  json += ",\"malformed\":" + num(malformedCount);
-  json += ",\"avatar\":" + str(currentAvatar);
-  json += ",\"webControl\":" + std::string(boolean(ENABLE_WEB_CONTROL));
-  json += ",\"oscquery\":" + std::string(boolean(!device.oscqueryName.empty()));
-  json += ",\"oscqueryName\":" + str(device.oscqueryName);
-  json += ",\"oscqueryClient\":" + str(oscqueryClient);
-  json += ",\"oscqueryAgeMs\":" + num(now - oscqueryAt);
-
-  json += ",\"relays\":[";
-  for (size_t i = 0; i < relays.size(); i++) {
-    const RelayConfig& cfg = relays.config(i);
-    if (i) json += ',';
-    json += "{\"param\":" + str(cfg.param) + ",\"pin\":" + num(cfg.pin) + ",\"mode\":\"" + modeName(cfg.mode) +
-            "\",\"input\":" + boolean(relays.inputActive(i)) + ",\"on\":" + boolean(relays.isOn(i)) + "}";
-  }
-
-  json += "],\"params\":[";
-  bool first = true;
-  for (const auto& kv : seenParams) {
-    if (!first) json += ',';
-    first = false;
-    json += "{\"name\":" + str(kv.first) + ",\"value\":" + str(kv.second.value) +
-            ",\"ageMs\":" + num(now - kv.second.updatedAt) + "}";
-  }
-  json += "]}";
-  return json;
-}
 
 // ----- OSCQuery ----------------------------------------------------------------------------------
 // ACCESS: 0 = none, 1 = read, 2 = write, 3 = read/write. We only receive, so /avatar is write-only.
@@ -220,12 +296,16 @@ void begin(SendFn sendToVrchatFn) {
   relays.begin(onRelayChanged);
 }
 
-void setDeviceInfo(const DeviceInfo& info) { device = info; }
+void setDeviceInfo(const DeviceInfo& info) {
+  device = info;
+  snapshotNeeded = true;
+}
 
 void handlePacket(const uint8_t* data, size_t len, const std::string& fromIp) {
   vrchatIp = fromIp;
   lastPacketAt = hal::millis();
   packetCount++;
+  infoDirty = true;
   if (len == 0 || !osc::parsePacket(data, len, onOscMessage)) malformedCount++;
 }
 
@@ -254,12 +334,49 @@ HttpResponse handleWeb(const HttpRequest& req) {
   return HttpResponse(404, "text/plain", "not found");
 }
 
+const char kEventStreamHeaders[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/event-stream\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"
+    "retry: 2000\n\n";  // browser reconnect delay after the stream drops
+
+std::string eventSnapshot() { return sseEvent("state", stateJson()); }
+
+std::string takeEvents(bool anyClients) {
+  uint32_t now = hal::millis();
+  if (!anyClients) {  // nobody listening: new clients start from a snapshot anyway
+    clearDirty();
+    lastEventAt = now;
+    return "";
+  }
+  if (snapshotNeeded) {
+    clearDirty();
+    lastEventAt = now;
+    return eventSnapshot();
+  }
+  bool batchDue = (infoDirty || !dirtyParams.empty()) && now - lastEventAt >= kEventBatchMs;
+  if (relaysDirty || batchDue) {
+    std::string event = sseEvent("update", updateJson());
+    clearDirty();
+    lastEventAt = now;
+    return event;
+  }
+  if (now - lastEventAt >= kEventHeartbeatMs) {
+    lastEventAt = now;
+    return ": ping\n\n";  // SSE comment, ignored by the browser
+  }
+  return "";
+}
+
 // OSCQuery serves the node at the requested path; HOST_INFO is a query flag on any path.
 HttpResponse handleOscQuery(const HttpRequest& req) {
   if (req.args.count("HOST_INFO")) {
     if (req.clientIp != oscqueryClient) hal::log("[oscquery] HOST_INFO read by %s\n", req.clientIp.c_str());
     oscqueryClient = req.clientIp;
     oscqueryAt = hal::millis();
+    infoDirty = true;
     return HttpResponse(200, kJson, hostInfoJson());
   }
 

@@ -129,8 +129,15 @@ plugged into the wall.
 | `scripts/twin_targets.py` | Adds the "Run PC twin" tasks to the PlatformIO sidebar |
 | `tools/fake_vrchat.py` | Send test parameters to the ESP32, or print incoming OSC |
 
-HTTP API: `GET /api/state` (JSON with relays and all seen parameters),
-`POST /api/relay?i=<index>&on=<0|1>` (manual switch; disable with `ENABLE_WEB_CONTROL`).
+HTTP API:
+- `GET /api/state`: JSON `{"info":{...},"relays":[...],"params":[...]}`.
+- `GET /api/events`: the same data as a live [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+  stream. It starts with a `state` event (everything), then sends `update` events with the relays and
+  the parameters that changed. Relay changes go out immediately; parameter changes are batched every
+  150 ms. The status page uses this and shows *live* / *reconnecting…* next to the title. It falls
+  back to polling `/api/state` if the stream is refused. At most 2 streams on the ESP32 (3 on the
+  PC twin); a new one replaces the oldest.
+- `POST /api/relay?i=<index>&on=<0|1>`: manual switch; disable with `ENABLE_WEB_CONTROL`.
 
 ## Next steps
 

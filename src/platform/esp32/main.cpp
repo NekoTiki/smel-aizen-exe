@@ -71,7 +71,76 @@ void serve(WebServer& server, bridge::HttpResponse (*handler)(const bridge::Http
   server.send(res.status, res.contentType, res.body.c_str());
 }
 
+// ----- Live status page (Server-Sent Events) -----------------------------------------------------
+// WebServer forgets a connection once the handler returns, but WiFiClient copies share the socket,
+// so keeping a copy keeps the stream open. Sockets are scarce on the ESP32, hence the low cap.
+
+constexpr size_t kMaxEventClients = 2;
+WiFiClient eventClients[kMaxEventClients];
+uint32_t eventClientSince[kMaxEventClients];
+uint32_t lastEventCheck = 0;
+
+size_t openEventClients() {
+  size_t n = 0;
+  for (WiFiClient& c : eventClients) n += c ? 1 : 0;
+  return n;
+}
+
+void dropEventClient(size_t i, const char* why) {
+  eventClients[i].stop();
+  eventClients[i] = WiFiClient();
+  hal::log("[web] live page %s (%u open)\n", why, static_cast<unsigned>(openEventClients()));
+}
+
+void dropAllEventClients() {
+  for (size_t i = 0; i < kMaxEventClients; i++) {
+    if (eventClients[i]) dropEventClient(i, "disconnected");
+  }
+}
+
+// WiFiClient::write retries for up to 10 s on a full socket; a browser that went out of range
+// must not freeze relay handling, so only write when the socket can take data right now.
+bool writeNow(WiFiClient& c, const std::string& data) {
+  int fd = c.fd();
+  if (fd < 0) return false;
+  fd_set set;
+  FD_ZERO(&set);
+  FD_SET(fd, &set);
+  timeval zero = {0, 0};
+  if (select(fd + 1, nullptr, &set, nullptr, &zero) <= 0) return false;
+  return c.write(reinterpret_cast<const uint8_t*>(data.data()), data.size()) == data.size();
+}
+
+void handleEvents() {
+  WiFiClient c = web.client();
+  size_t slot = 0;
+  for (size_t i = 0; i < kMaxEventClients; i++) {  // a free slot, else the oldest stream
+    if (!eventClients[i]) {
+      slot = i;
+      break;
+    }
+    if (eventClientSince[i] < eventClientSince[slot]) slot = i;
+  }
+  if (eventClients[slot]) dropEventClient(slot, "dropped (too many open)");
+  if (!writeNow(c, std::string(bridge::kEventStreamHeaders) + bridge::eventSnapshot())) return;
+  eventClients[slot] = c;
+  eventClientSince[slot] = millis();
+  hal::log("[web] live page connected (%u open)\n", static_cast<unsigned>(openEventClients()));
+}
+
+void broadcastEvents() {
+  std::string events = bridge::takeEvents(openEventClients() > 0);
+  bool check = millis() - lastEventCheck >= 1000;
+  if (check) lastEventCheck = millis();
+  for (size_t i = 0; i < kMaxEventClients; i++) {
+    WiFiClient& c = eventClients[i];
+    if (!c) continue;
+    if ((check && !c.connected()) || (!events.empty() && !writeNow(c, events))) dropEventClient(i, "disconnected");
+  }
+}
+
 void startServers() {
+  web.on(bridge::kEventsPath, HTTP_GET, handleEvents);
   web.onNotFound([] { serve(web, bridge::handleWeb); });
   web.begin();
   if (ENABLE_OSCQUERY) {
@@ -139,6 +208,7 @@ void checkWifi() {
     onWifiUp();
   } else {
     bridge::allOff("WiFi disconnected, reconnecting");
+    dropAllEventClients();
   }
 }
 
@@ -175,5 +245,6 @@ void loop() {
     if (ENABLE_OSCQUERY) oscqueryWeb.handleClient();
   }
   bridge::update();
+  if (wifiUp) broadcastEvents();
   delay(1);
 }

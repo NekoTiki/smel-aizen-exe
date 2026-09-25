@@ -42,6 +42,10 @@ env.AddCustomTarget(  # noqa: F821
     description="Build and start the twin; like the ESP32, VRChat finds it via OSCQuery",
 )
 
+# Old name from when loopback was the default; LAN mode is the default now. Not listed in the
+# sidebar, but a cached sidebar button (or a script) using it keeps working.
+env.Alias("run_twin_lan", "run_twin")  # noqa: F821
+
 env.AddCustomTarget(  # noqa: F821
     name="run_twin_local",
     dependencies=program,

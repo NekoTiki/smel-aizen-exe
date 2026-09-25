@@ -35,6 +35,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "bridge.h"
 #include "config.h"
@@ -100,6 +101,10 @@ bool wifiUp = true;
 SOCKET udpSock = INVALID_SOCKET;
 SOCKET webSock = INVALID_SOCKET;
 SOCKET oscquerySock = INVALID_SOCKET;
+
+// Open /api/events streams (live status page). Capped like on the ESP32, oldest dropped first.
+constexpr size_t kMaxEventClients = 3;
+std::vector<SOCKET> eventClients;
 sockaddr_in vrchatAddr = {};
 
 // ----- Networking --------------------------------------------------------------------------------
@@ -192,6 +197,52 @@ const char* reason(int status) {
   }
 }
 
+// ----- Live status page (Server-Sent Events) -----------------------------------------------------
+
+bool sendAll(SOCKET s, const std::string& data) {
+  return send(s, data.data(), static_cast<int>(data.size()), 0) == static_cast<int>(data.size());
+}
+
+void dropEventClient(size_t index, const char* why) {
+  closesocket(eventClients[index]);
+  eventClients.erase(eventClients.begin() + index);
+  hal::log("[web] live page %s (%u open)\n", why, static_cast<unsigned>(eventClients.size()));
+}
+
+void dropAllEventClients() {
+  while (!eventClients.empty()) dropEventClient(0, "disconnected");
+}
+
+void startEventStream(SOCKET c) {
+  // A stalled browser must not freeze the loop: give up on a send after 200 ms and drop it.
+  DWORD sendTimeoutMs = 200;
+  setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sendTimeoutMs), sizeof sendTimeoutMs);
+  if (!sendAll(c, std::string(bridge::kEventStreamHeaders) + bridge::eventSnapshot())) {
+    closesocket(c);
+    return;
+  }
+  if (eventClients.size() >= kMaxEventClients) dropEventClient(0, "dropped (too many open)");
+  eventClients.push_back(c);
+  hal::log("[web] live page connected (%u open)\n", static_cast<unsigned>(eventClients.size()));
+}
+
+void broadcastEvents() {
+  std::string events = bridge::takeEvents(!eventClients.empty());
+  if (events.empty()) return;
+  for (size_t i = eventClients.size(); i-- > 0;) {
+    if (!sendAll(eventClients[i], events)) dropEventClient(i, "disconnected");
+  }
+}
+
+// Browsers never send anything on an event stream, so readable means closed (recv returns 0).
+void checkEventClients(const fd_set& readable) {
+  for (size_t i = eventClients.size(); i-- > 0;) {
+    if (!FD_ISSET(eventClients[i], &readable)) continue;
+    char buf[256];
+    if (recv(eventClients[i], buf, sizeof buf, 0) <= 0) dropEventClient(i, "disconnected");
+  }
+}
+
 // A deliberately small HTTP/1.1 server: one request per connection, like the ESP32 WebServer.
 void serveHttp(SOCKET listener, bridge::HttpResponse (*handler)(const bridge::HttpRequest&)) {
   sockaddr_in peer = {};
@@ -240,6 +291,11 @@ void serveHttp(SOCKET listener, bridge::HttpResponse (*handler)(const bridge::Ht
     }
   }
   req.clientIp = ipToString(peer.sin_addr);
+
+  if (listener == webSock && req.method == "GET" && req.path == bridge::kEventsPath) {
+    startEventStream(c);  // the socket stays open
+    return;
+  }
 
   bridge::HttpResponse res = handler(req);
   std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + reason(res.status) +
@@ -346,6 +402,7 @@ void runCommands() {
     if (cmd == "wifi down" && wifiUp) {
       wifiUp = false;
       bridge::allOff("WiFi disconnected, reconnecting");
+      dropAllEventClients();  // like the board: open pages lose their connection and retry
     } else if (cmd == "wifi up" && !wifiUp) {
       wifiUp = true;
       hal::log("[wifi] connected again\n");
@@ -479,8 +536,10 @@ int main(int argc, char** argv) {
     FD_SET(udpSock, &readable);
     FD_SET(webSock, &readable);
     if (oscquerySock != INVALID_SOCKET) FD_SET(oscquerySock, &readable);
+    for (SOCKET s : eventClients) FD_SET(s, &readable);
     timeval tick = {0, 5000};  // 5 ms, about how often the ESP32 loop comes around
     if (select(0, &readable, nullptr, nullptr, &tick) > 0) {
+      checkEventClients(readable);  // before serveHttp can change the list
       if (FD_ISSET(udpSock, &readable)) pollOsc();
       if (FD_ISSET(webSock, &readable)) serveHttp(webSock, bridge::handleWeb);
       if (oscquerySock != INVALID_SOCKET && FD_ISSET(oscquerySock, &readable)) {
@@ -489,10 +548,12 @@ int main(int argc, char** argv) {
     }
     runCommands();
     bridge::update();
+    broadcastEvents();
   }
 
   hal::log("[twin] shutting down\n");
   bridge::allOff("shutdown");
+  dropAllEventClients();
   deregisterMdns();
   WSACleanup();
   return 0;
