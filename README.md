@@ -16,9 +16,10 @@ is shown in the console.
 
 ## 1. Firmware
 
-Two boards are set up: **ESP32-S3-DevKitC-1** (the default, see
-[docs/esp32-s3-devkitc-1.md](docs/esp32-s3-devkitc-1.md)) and a generic **ESP32 devkit**
-(`pio run -e esp32dev -t upload`). The relay pins are picked per board in `config.h`.
+Three boards are set up: **ESP32-S3-DevKitC-1** (the default, see
+[docs/esp32-s3-devkitc-1.md](docs/esp32-s3-devkitc-1.md)), a **WEMOS LOLIN S3**
+(`pio run -e lolin_s3 -t upload`; plug into the port marked "USB", that is where its serial logs
+come out) and a generic **ESP32 devkit** (`pio run -e esp32dev -t upload`). The relay pins are picked per board in `config.h`.
 
 1. Install [PlatformIO](https://platformio.org/) (VS Code extension or `pip install platformio`).
 2. `copy include\secrets.example.h include\secrets.h` and put your WiFi name/password in it.
