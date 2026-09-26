@@ -200,8 +200,44 @@ void onWifiUp() {
   }
 }
 
+const char* wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_CONNECTED: return "connected";
+    case WL_NO_SSID_AVAIL: return "network not found (check WIFI_SSID, 2.4 GHz only)";
+    case WL_CONNECT_FAILED: return "connection failed (check WIFI_PASSWORD)";
+    case WL_CONNECTION_LOST: return "connection lost";
+    case WL_DISCONNECTED: return "disconnected";
+    case WL_IDLE_STATUS: return "idle";
+    default: return "unknown";
+  }
+}
+
+// Boot logs are gone once the monitor attaches late (native-USB boards reconnect after every
+// reset), so pressing a key in the serial monitor prints the current state again.
+void printStatus() {
+  hal::log("[status] up %lus, WiFi \"%s\": %s\n", millis() / 1000, WIFI_SSID, wifiStatusName(WiFi.status()));
+  if (wifiUp) {
+    String ip = WiFi.localIP().toString();
+    hal::log("[status] IP %s, status page http://%s.local/ or http://%s/\n", ip.c_str(), DEVICE_HOSTNAME,
+             ip.c_str());
+  }
+}
+
+// Any key works; the monitor may send Enter as \r, \n or both, so read everything and print once.
+void checkSerialInput() {
+  if (Serial.available() <= 0) return;
+  while (Serial.available() > 0) Serial.read();
+  printStatus();
+}
+
+uint32_t lastWifiWaitLog = 0;
+
 void checkWifi() {
   bool up = WiFi.status() == WL_CONNECTED;
+  if (!up && millis() - lastWifiWaitLog >= 5000) {
+    lastWifiWaitLog = millis();
+    hal::log("[wifi] still waiting for \"%s\": %s\n", WIFI_SSID, wifiStatusName(WiFi.status()));
+  }
   if (up == wifiUp) return;
   wifiUp = up;
   if (up) {
@@ -216,6 +252,10 @@ void checkWifi() {
 
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+  // Native USB (e.g. LOLIN S3): the port re-enumerates on reset; give the monitor time to attach.
+  while (!Serial && millis() < 3000) delay(10);
+#endif
   delay(200);
   Serial.println("\n=== VRChat OSC relay bridge ===");
 
@@ -238,6 +278,7 @@ void setup() {
 }
 
 void loop() {
+  checkSerialInput();
   checkWifi();
   if (wifiUp) {
     pollOsc();
